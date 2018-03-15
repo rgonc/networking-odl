@@ -1,0 +1,6 @@
+[neutron.service_plugins]
+odl-router = networking_odl.l3.l3_odl.OpenDaylightL3RouterPlugin
+
+[neutron.ml2.mechanism_drivers]
+opendaylight = neutron.plugins.ml2.drivers.opendaylight.driver:OpenDaylightMechanismDriver
+
