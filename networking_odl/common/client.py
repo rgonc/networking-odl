@@ -17,6 +17,9 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 import requests
 
+from networking_odl.openstack.common._i18n import _LE
+from networking_odl.openstack.common._i18n import _LI
+
 
 LOG = logging.getLogger(__name__)
 
@@ -40,6 +43,13 @@ class OpenDaylightRestClient(object):
                              headers=headers, data=data,
                              auth=self.auth, timeout=self.timeout)
         r.raise_for_status()
+        new_obj = None
+        try:
+            new_obj = r.json()
+        except Exception:
+            LOG.debug("requests result is not json")
+        LOG.debug("%(result)s", {'result': new_obj})
+        return new_obj
 
     def try_delete(self, urlpath):
         try:
