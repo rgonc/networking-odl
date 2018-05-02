@@ -24,8 +24,15 @@ import requests
 from neutron.common import exceptions as n_exc
 from neutron.common import utils
 from neutron import context
+from neutron.db import api as db_api
 from neutron.extensions import securitygroup as sg
+from neutron.extensions import providernet as provider
+from neutron.plugins.common import utils as plugin_utils
 from neutron.plugins.ml2 import driver_context
+from neutron.plugins.ml2 import db
+from neutron.plugins.ml2 import driver_api as api
+from neutron.plugins.ml2.drivers import type_vlan
+from neutron.plugins.ml2.drivers import type_vxlan
 
 from networking_odl.common import callback as odl_call
 from networking_odl.common import client as odl_client
@@ -204,25 +211,29 @@ class OpenDaylightDriver(object):
         )
         self.sec_handler = odl_call.OdlSecurityGroupsHandler(self)
 
+        #add by hqf: get provider network
+        self.network_vlan_ranges = plugin_utils.parse_network_vlan_ranges(
+                cfg.CONF.ml2_type_vlan.network_vlan_ranges)
+        self.physical_network = self.get_physical_network()
+
     def synchronize(self, operation, object_type, context):
         """Synchronize ODL with Neutron following a configuration change."""
-        LOG.info(_LI("afred Begin synchronize out_of_sync is %(out_of_sync)s"),
-                    {'out_of_sync': self.out_of_sync})
+        LOG.debug("synchronize 1 out_of_sync is %(out_of_sync)s",
+            {'out_of_sync': self.out_of_sync})
         if self.out_of_sync:
             self.sync_full(context._plugin)
-            LOG.info("afred sync_full")
-            if operation in [odl_const.ODL_UPDATE, odl_const.ODL_DELETE]:
-                # NOTE(yamahata): work around that sync_full doesn't know
-                # how to handle UPDATE and DELETE at the moment.
-                # TODO(yamahata): implement TODOs in sync_full and remove this
-                # work around
-                self.sync_single_resource(operation, object_type, context)
+            LOG.info("afred sync_full")            
+            if operation in [odl_const.ODL_UPDATE, odl_const.ODL_DELETE]:                
+                # NOTE: work around that sync_full doesn't know                
+                # how to handle UPDATE and DELETE at the moment.                
+                # TODO: implement TODOs in sync_full and remove this                
+                # work around                
+                self.sync_single_resource(operation, object_type, context)                
                 LOG.info("afred sync_full Delete or Update")
-
         else:
             self.sync_single_resource(operation, object_type, context)
-        LOG.info(_LI("afred End synchronize out_of_sync is %(out_of_sync)s"),
-                    {'out_of_sync': self.out_of_sync})
+        LOG.debug("synchronize 2 out_of_sync is %(out_of_sync)s",
+            {'out_of_sync': self.out_of_sync})
 
     def sync_resources(self, plugin, dbcontext, collection_name):
         """Sync objects from Neutron over to OpenDaylight.
@@ -260,8 +271,20 @@ class OpenDaylightDriver(object):
             collection_name)
         # Convert underscores to dashes in the URL for ODL
         collection_name_url = collection_name.replace('_', '-')
-        self.client.sendjson('post', collection_name_url, {key: to_be_synced})
-
+        new_objs_obj = self.client.sendjson('post', collection_name_url, {key: to_be_synced})
+        
+        # add by hqf
+        if collection_name == odl_const.ODL_NETWORKS:
+            new_objs = new_objs_obj.get(key)
+            if key == collection_name:
+                for new_obj in new_objs:
+                    LOG.info(_LI("new_obj %(new_obj)s"),
+                        {'new_obj': new_obj})
+                    self.update_network_segments(new_obj)
+            else:
+                self.update_network_segments(new_objs)
+        # add by hqf end
+        
         # https://bugs.launchpad.net/networking-odl/+bug/1371115
         # TODO(yamahata): update resources with unsyned attributes
         # TODO(yamahata): find dangling ODL resouce that was deleted in
@@ -274,6 +297,8 @@ class OpenDaylightDriver(object):
         Transition to the in-sync state on success.
         Note: we only allow a single thread in here at a time.
         """
+        LOG.debug("sync_full 1 out_of_sync is %(out_of_sync)s",
+            {'out_of_sync': self.out_of_sync})
         if not self.out_of_sync:
             return
         dbcontext = context.get_admin_context()
@@ -284,6 +309,119 @@ class OpenDaylightDriver(object):
                                 odl_const.ODL_SG_RULES]:
             self.sync_resources(plugin, dbcontext, collection_name)
         self.out_of_sync = False
+        LOG.debug("sync_full 2 out_of_sync is %(out_of_sync)s",
+            {'out_of_sync': self.out_of_sync})
+
+    def update_network_segments(self, new_obj):
+        obj_id = new_obj.get('id')
+        LOG.debug("update network segments for %(obj_id)s",
+                {'obj_id': obj_id})
+        try:
+            new_segments = new_obj.get('segments')
+            if new_segments == None:
+                return
+            LOG.debug("new_segments %(new_segments)s",
+                {'new_segments': new_segments})
+            session = db_api.get_session()
+            with session.begin(subtransactions=True):
+                segments=db.get_network_segments(session, obj_id)
+                LOG.debug("update network segments when old segments %(segments)s",
+                    {'segments': segments})
+                phy_network = self.physical_network
+                for segment in segments:
+                    db.delete_network_segment(session, segment.get(api.ID))
+                for new_segment in new_segments:
+                    network_type = new_segment.get(provider.NETWORK_TYPE)
+                    model = None
+                    filters = {}
+                    segmentation_id = new_segment.get(provider.SEGMENTATION_ID)
+                    new_segment_db = {api.NETWORK_TYPE: network_type,
+                                      api.PHYSICAL_NETWORK: new_segment.get(provider.PHYSICAL_NETWORK),
+                                      api.SEGMENTATION_ID: segmentation_id}
+                    if new_segment.get(provider.NETWORK_TYPE) == 'vlan':
+                        segment_index = 0                        
+                        new_segment_db = {api.NETWORK_TYPE: network_type,
+                                      api.PHYSICAL_NETWORK: phy_network,
+                                      api.SEGMENTATION_ID: segmentation_id}
+                        model = type_vlan.VlanAllocation
+                        filters['physical_network'] = phy_network
+                        filters['vlan_id'] = segmentation_id
+                    else:
+                        segment_index = 1
+                        model = type_vxlan.VxlanAllocation
+                        filters['vxlan_vni'] = segmentation_id
+                    LOG.debug("update network segments when new segment %(new_segment)s",
+                        {'new_segment': new_segment_db})
+                    self.allocate_fully_specified_segment(session, network_type, model, **filters)
+                    db.add_network_segment(session, obj_id, new_segment_db, segment_index)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE("update network segments error on "
+                              "%(object_id)s"),
+                          {'object_id': obj_id})
+
+    def get_physical_network(self):
+        if self.network_vlan_ranges == None:
+            return
+        for physical_network in self.network_vlan_ranges:
+            LOG.info(_LI("physical network is %(physical_network)s"),
+                        {'physical_network': physical_network})
+            return physical_network
+            
+    def allocate_fully_specified_segment(self, session, network_type, model, **raw_segment):
+        """Allocate segment fully specified by raw_segment.
+
+        If segment exists, then try to allocate it and return db object
+        If segment does not exists, then try to create it and return db object
+        If allocation/creation failed, then return None
+        """
+
+        try:
+            with session.begin(subtransactions=True):
+                alloc = (session.query(model).filter_by(**raw_segment).
+                         first())
+                if alloc:
+                    if alloc.allocated:
+                        # Segment already allocated
+                        return
+                    else:
+                        # Segment not allocated
+                        LOG.debug("%(type)s segment %(segment)s allocate "
+                                  "started ",
+                                  {"type": network_type,
+                                   "segment": raw_segment})
+                        count = (session.query(model).
+                                 filter_by(allocated=False, **raw_segment).
+                                 update({"allocated": True}))
+                        if count:
+                            LOG.debug("%(type)s segment %(segment)s allocate "
+                                      "done ",
+                                  {"type": network_type,
+                                   "segment": raw_segment})
+                            return alloc
+
+                        # Segment allocated or deleted since select
+                        LOG.debug("%(type)s segment %(segment)s allocate "
+                                  "failed: segment has been allocated or "
+                                  "deleted",
+                                  {"type": network_type,
+                                   "segment": raw_segment})
+
+                # Segment to create or already allocated
+                LOG.debug("%(type)s segment %(segment)s create started",
+                          {"type": network_type, "segment": raw_segment})
+                alloc = model(allocated=True, **raw_segment)
+                alloc.save(session)
+                LOG.debug("%(type)s segment %(segment)s create done",
+                          {"type": network_type, "segment": raw_segment})
+
+        except db_exc.DBDuplicateEntry:
+            # Segment already allocated (insert failure)
+            alloc = None
+            LOG.debug("%(type)s segment %(segment)s create failed",
+                      {"type": network_type, "segment": raw_segment})
+
+        return alloc
 
     def sync_single_resource(self, operation, object_type, context):
         """Sync over a single resource from Neutron to OpenDaylight.
@@ -299,6 +437,8 @@ class OpenDaylightDriver(object):
             if operation == odl_const.ODL_DELETE:
                 self.out_of_sync |= not self.client.try_delete(
                     object_type_url + '/' + obj_id)
+                LOG.debug("sync_single_resource 1 out_of_sync is %(out_of_sync)s",
+                   {'out_of_sync': self.out_of_sync})
             else:
                 filter_cls = self.FILTER_MAP[object_type]
                 if operation == odl_const.ODL_CREATE:
@@ -311,8 +451,14 @@ class OpenDaylightDriver(object):
                     attr_filter = filter_cls.filter_update_attributes
                 resource = context.current.copy()
                 attr_filter(resource, context)
-                self.client.sendjson(method, urlpath,
+                new_obj_obj = self.client.sendjson(method, urlpath,
                                      {object_type_url[:-1]: resource})
+                
+                # byhqf
+                if operation == odl_const.ODL_CREATE:
+                    if object_type == odl_const.ODL_NETWORKS:
+                        self.update_network_segments(new_obj_obj.get('network'))
+                # byhqf end
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE("Unable to perform %(operation)s on "
@@ -321,6 +467,8 @@ class OpenDaylightDriver(object):
                            'object_type': object_type,
                            'object_id': obj_id})
                 self.out_of_sync = True
+                LOG.debug("sync_single_resource 2 out_of_sync is %(out_of_sync)s",
+                   {'out_of_sync': self.out_of_sync})
 
     def sync_from_callback(self, operation, object_type, res_id,
                            resource_dict):
@@ -328,6 +476,8 @@ class OpenDaylightDriver(object):
             if operation == odl_const.ODL_DELETE:
                 self.out_of_sync |= not self.client.try_delete(
                     object_type + '/' + res_id)
+                LOG.debug("sync_from_callback 1 out_of_sync is %(out_of_sync)s",
+                   {'out_of_sync': self.out_of_sync})
             else:
                 if operation == odl_const.ODL_CREATE:
                     urlpath = object_type
@@ -345,3 +495,5 @@ class OpenDaylightDriver(object):
                            'res_id': res_id,
                            'resource_dict': resource_dict})
                 self.out_of_sync = True
+                LOG.debug("sync_from_callback 2 out_of_sync is %(out_of_sync)s",
+                   {'out_of_sync': self.out_of_sync})
